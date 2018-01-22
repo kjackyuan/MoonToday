@@ -6,25 +6,32 @@ import os
 import csv
 
 root_site = 'https://api.binance.com'
+defaultPublicKey = 'vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A'
+defaultSecretKey = 'NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j'
 
-with open('api.cred.json', 'r') as f:
-    data = json.load(f)
-    publicKey = data['public_key']
-    secretKey = data['secret_key']
+commands = {
+    'ping': '/api/v1/ping',
+    'time': '/api/v1/time',
+    'orderbook': '/api/v1/depth',
+    'trade': '/api/v3/order',
+    'candle': '/api/v1/klines',
+    'account': '/api/v3/account'
+}
+
+cred_file = 'api.cred.json'
 
 
-ping = '/api/v1/ping'
-time = '/api/v1/time'
+try:
+    with open(cred_file, 'r') as f:
+        data = json.load(f)
+        publicKey = data['public_key']
+        secretKey = data['secret_key']
+except IOError:
+    publicKey = defaultPublicKey
+    secretKey = defaultSecretKey
 
-orderbook = '/api/v1/depth'
-trade = '/api/v3/order'
-candle = '/api/v1/klines'
-account = '/api/v3/account'
 
-def serverTime():
-    return requests.get(root_site + time).json()['serverTime']
-
-def data_string(params):
+def compose_query_string(params):
     data = r''
     for key in sorted(params.keys()):
         data += r'%s=%s&' % (key[1:], params[key])
@@ -35,47 +42,21 @@ def data_string(params):
 def signer(data):
     return hmac.new(secretKey, data, hashlib.sha256).hexdigest()
 
-def trade_coin(symbol, side, quantity, price):
-    template = {
-        '1symbol': symbol.upper(),
-        '2side': side.upper(),
-        '3type': 'LIMIT',
-        '4timeInForce': 'GTC',
-        '5quantity': quantity,
-        '6price': price
-    }
 
-    data = data_string(template)
-    print data
-    print signer(data)
-    r = requests.post(root_site + trade + '?' + data + '&signature=%s' % signer(data), headers={'X-MBX-APIKEY': publicKey}).json()
-    print r
-    return r, r['orderId']
+def serverTime():
+    return requests.get(root_site + time).json()['serverTime']
 
-def check_order(symbol, orderId):
-    template = {
-        '1symbol': symbol.upper(),
-        '2orderId': orderId
-    }
 
-    data = data_string(template)
-    r = requests.get(root_site + trade + '?' + data + '&signature=%s' % signer(data), headers={'X-MBX-APIKEY': publicKey}).json()
-    print r
-    return r, r['status']
 
-def wait_done(symbol, orderId):
-    while(check_order(symbol, orderId)[1] != u'FILLED'):
-        pass
-    
-eth_min = 1
-btc_min = 0.06
+eth_min_vol = 1
+btc_min_vol = 0.06
 safety_ratio = 0.7
 
-def sat_vol(top, bot, prices):
-    if bot == 'btc':
-        thresh = btc_min
-    elif bot == 'eth':
-        thresh = eth_min
+def check_volume(base_coin, prices):
+    if base_coin == 'btc':
+        thresh = btc_min_vol
+    elif base_coin == 'eth':
+        thresh = eth_min_vol
         
     total_vol = 0
     for price, vol, _ in prices:
@@ -89,21 +70,81 @@ def sat_vol(top, bot, prices):
     return last_price, total_vol
 
 
-if not os.path.exists('error_log.txt'):
-    with open('error_log.txt', 'wb') as f:
-        pass
+def log_maker(filename):
+    if not os.path.exists(filename):
+        with open(filename, 'wb') as f:
+            pass
 
-def get_price(top, bot, tradeType):
-    data = requests.get(root_site + orderbook, params={'symbol':'%s%s'%(top.upper(), bot.upper()), 'limit': '10'})
+    def decorator(fcn):
+        def log(*args, **kwargs):
+            with open(filename, 'a') as f:
+                f.write(', '.join(args))
+                f.write('\n')
+                f.write(kwargs['data'].text)
+                f.write('\n\n')
+
+        setattr(fcn, 'log', log)
+        return fcn
+
+    return decorator
+
+
+@log_maker('price_fail.err')
+def log_price_failure(target_coin, base_coin, tradeType, data):
+    log_price_failure.log(target_coin, base_coin, tradeType, data=data)
+
+@log_maker('trade_fail.err')
+def log_trade_failure(symbol, side, data):
+    log_trade_failure.log(symbol, side, data=data)
+
+
+def get_price(target_coin, base_coin, tradeType):
+    data = requests.get(root_site + orderbook, params={'symbol':'%s%s'%(target_coin.upper(), base_coin.upper()), 'limit': '10'})
     if data.ok:
         data = data.json()
-        return sat_vol(top, bot, data[tradeType])
+        last_price, total_vol = check_volume(base_coin, data[tradeType])
+        return last_price, total_vol
     else:
-        with open('error_log.txt', 'a') as f:
-            f.write('%s, %s, %s:\n' % (top, bot, tradeType))
-            f.write(data.text)
-            f.write('\n\n\n\n')
+        log_price_failure(target_coin, base_coin, tradeType, data)
         return (0, 0)
+
+
+def make_trade(symbol, side, quantity, price):
+    template = {
+        '1symbol': symbol.upper(),
+        '2side': side.upper(),
+        '3type': 'LIMIT',
+        '4timeInForce': 'GTC',
+        '5quantity': quantity,
+        '6price': price
+    }
+
+    data = compose_query_string(template)
+    r = requests.post(root_site + trade + '?' + data + '&signature=%s' % signer(data), headers={'X-MBX-APIKEY': publicKey})
+
+    if r.ok:
+        r = r.json()
+        return r, r['orderId']
+    else:
+        log_trade_failure(symbol, side, data)
+        return None, None
+
+
+def check_order(symbol, orderId):
+    template = {
+        '1symbol': symbol.upper(),
+        '2orderId': orderId
+    }
+
+    data = compose_query_string(template)
+    r = requests.get(root_site + trade + '?' + data + '&signature=%s' % signer(data), headers={'X-MBX-APIKEY': publicKey}).json()
+    return r, r['status']
+
+
+
+def wait_done(symbol, orderId):
+    while(check_order(symbol, orderId)[1] != u'FILLED'):
+        pass
 
 
 def eth_btc_alt_eth(alt):
@@ -128,37 +169,22 @@ def eth_alt_btc_eth(alt):
 
 candidates = ['bcd', 'dgd', 'xzc', 'ppt', 'nav', 'nebl', 'waves', 'kmd', 'btg', 'ark', 'storj', 'strat', 'zec', 'mod', 'oax',
               'iota', 'neo', 'icx', 'req', 'appc', 'ven', 'eos', 'poe', 'ltc', 'xvg', 'xlm', 'bnb', 'ada', 'arn', 'xrp', 'trx']
-#candidates = ['bnb']
 
 stride = 8
 alt_input = [(idx, candidates[x:x+stride]) for idx, x in enumerate(xrange(0, len(candidates), stride))]
 
 
 price_thresh = 1.003
-output_file = 'shitcoin_profit_%s.csv'
-heartbeat = 100
-
-if not os.path.exists('alive.csv'):
-    with open('alive.csv', 'wb') as f:
-        pass
+output_file = 'coin_profit_%s.csv'
 
 
-def monika_monitor((pid, targets)):
-    counter = 0
+def monika_arbitrage(pid, targets):
     while True:
-        if counter == 0 or counter == heartbeat:
-            counter = 1
-            with open('alive.csv', 'a') as f:
-                csv.writer(f).writerow([pid])
-
-        counter += 1
-
         for alt in targets:
             price1, vol1, p11, p12, p13 = eth_btc_alt_eth(alt)
             price2, vol2, p21, p22, p23 = eth_alt_btc_eth(alt)
             
             if (price1 >= price_thresh or price2 >= price_thresh):
-                print 'TRADE! %s' % alt
                 with open(output_file % pid, 'a') as f:
                     writer = csv.writer(f)
                     writer.writerow([alt, price1, vol1, price2, vol2])
@@ -170,29 +196,41 @@ def monika_monitor((pid, targets)):
                     symbol = 'ethbtc'
                     vol = eth_min * safety_ratio
                     sell_eth_btc, orderId = trade_coin(symbol, 'sell', vol, p11)
+                    if orderId is None:
+                        continue
                     wait_done(symbol, orderId)
 
                     symbol = '%sbtc' % alt
                     vol = (vol * p11) / p12
                     buy_alt_btc, orderId = trade_coin(symbol, 'buy', vol, p12)
+                    if orderId is None:
+                        continue
                     wait_done(symbol, orderId)
 
                     symbol = '%seth' % alt
                     sell_alt_eth, orderId = trade_coin(symbol, 'sell', vol, p13)
+                    if orderId is None:
+                        continue
                     wait_done(symbol, orderId)
                 else:
                     symbol = '%seth' % alt
                     vol = (eth_min * safety_ratio) / p21
                     buy_alt_eth, orderId = trade_coin(symbol, 'buy', vol, p21)
+                    if orderId is None:
+                        continue
                     wait_done(symbol, orderId)
 
                     symbol = '%sbtc' % alt
                     sell_alt_btc, orderId = trade_coin(symbol, 'sell', vol, p22)
+                    if orderId is None:
+                        continue
                     wait_done(symbol, orderId)
 
                     symbol = 'ethbtc'
                     vol = vol * p22
                     buy_eth_btc, orderId = trade_coin(symbol, 'buy', vol, p23)
+                    if orderId is None:
+                        continue
                     wait_done(symbol, orderId)
                 
 
@@ -204,6 +242,4 @@ for i, alts in alt_input:
             
 
 p = multiprocessing.Pool(len(alt_input))
-p.map(monika_monitor, alt_input)
-
-# monika_monitor(alt_input[0])
+p.map(monika_arbitrage, alt_input)
